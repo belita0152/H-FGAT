@@ -5,24 +5,6 @@ from dgl.dataloading import GraphDataLoader
 
 device = torch.device('cuda:0')
 
-def build_graph(node_features, edges):
-    batch_size, n_nodes = node_features.shape
-    graphs = []
-
-    for i in range(batch_size):
-        node, edge = node_features[i], edges[i]
-
-        src, dst = torch.nonzero(edge)  # turn to sparse matrix. threshold=0.5
-        weights = edge[src, dst]
-
-        g = dgl.graph((src, dst), num_nodes=n_nodes).to(device)  # generate graph
-        g.ndata['feat'], g.edata['w'] = node, weights  # features
-
-        graphs.append(g)
-
-    return dgl.batch(graphs)  # batch를 하나의 큰 그래프로 취급하여 병렬 연산
-
-
 class GraphDataset(DGLDataset):
     """
         edge.py에서 전처리되어 저장된 .pt 파일(x, y, edge)을 로드하여 제공
