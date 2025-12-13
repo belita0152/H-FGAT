@@ -1,3 +1,13 @@
+"""
+This module functions exactly in the same way as the Embedding GNN of DiffPool in the Meso state.
+
+Therefore, it is not used during the actual training process.
+
+This module exists only to evaluate the training process of Local state.
+
+"""
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
