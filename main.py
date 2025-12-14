@@ -1,14 +1,17 @@
 import os
-from data.node import EEGNet
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as opt
-import numpy as np
-import random
-from data.graph_dataloader import get_dataloaders
-from local.model import GCN
-from meso.cluster import DiffPoolGAT
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
+
+from data.node import EEGNet
+from data.graph_dataloader import get_dataloaders, get_balanced_dataloaders
+from global_.model import HierarchicalModel
+
+from sklearn.metrics import roc_auc_score
 
 
 random_seed = 777
@@ -20,26 +23,31 @@ random.seed(random_seed)
 device = torch.device('cuda:0')
 
 src_path = os.path.join(os.getcwd(), 'data')
-train_path = os.path.join(src_path, 'driver_train_dataset.pt')
-test_path = os.path.join(src_path, 'driver_test_dataset.pt')
-
+train_path = os.path.join(src_path, 'mi_train_dataset.pt')
+test_path = os.path.join(src_path, 'mi_test_dataset.pt')
 
 
 class Trainer(object):
     def __init__(self):
+        self.n_epochs = 100
+        self.batch_size = 32
+        self.lr = 0.001
+
+        # self.train_dataloader, self.test_dataloader = get_dataloaders(train_path, test_path, self.batch_size)
+        self.train_dataloader, self.test_dataloader = get_balanced_dataloaders(train_path, test_path, self.batch_size)
+
+        sample_batch = next(iter(self.train_dataloader))
+        self.n_nodes = int(sample_batch.x.shape[0] / sample_batch.num_graphs)
+
         self.net1 = EEGNet(f1=8, f2=16, d=2,
-                           input_time_length=384,
+                           input_time_length=sample_batch.x.shape[-1],
                            embedding_dim=64,
                            dropout_rate=0.5, sampling_rate=128, classes=2).to(device)
-        self.net2 = DiffPoolGAT(in_channels=64,
-                             hidden_channels=32,
-                             out_channels=2,
-                             n_nodes=30,
-                             n_clusters=8).to(device)
+        self.net2 = HierarchicalModel(in_channels=64,
+                                      hidden_channels=32,
+                                      out_channels=2,
+                                      n_nodes=self.n_nodes).to(device)
 
-        self.n_epochs = 100
-        self.batch_size = 64
-        self.lr = 0.005
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = opt.AdamW(
             list(self.net1.parameters()) + list(self.net2.parameters()),
@@ -50,7 +58,6 @@ class Trainer(object):
                                                                     T_max=self.n_epochs,
                                                                     eta_min=1e-5)
 
-        self.train_dataloader, self.test_dataloader = get_dataloaders(train_path, test_path, self.batch_size)
 
     def node_embed(self, batch):
         # 1. Node feature
@@ -81,16 +88,16 @@ class Trainer(object):
 
 
     def train(self):
-        initial_aux_weight = 0.1  # 초기 보조손실 가중치 비율
+        # initial_aux_weight = 0.1  # 초기 보조손실 가중치 비율. Total Loss = Global_CE + gamma * (Local_CE + Meso_CE) + alpha * (Link + Ent)
 
-        best_train_acc, best_test_acc = 0, 0
+        best_train_acc, best_test_acc, best_test_auc = 0, 0, 0
         train_acc_list, test_acc_list = [], []
+
+        gamma = 0.5
 
         for epoch in range(self.n_epochs):
             self.net1.train()
             self.net2.train()
-
-            aux_weight = initial_aux_weight * (1 - epoch / self.n_epochs)
 
             total_loss, correct, total_samples = 0, 0, 0
 
@@ -102,15 +109,23 @@ class Trainer(object):
                 batch.x = self.node_embed(batch) # outputs of EEGNet -> used as node features
 
                 # 2. Train Local states + Cluster Meso states
-                out, link_loss, ent_loss = self.net2(batch)
+                out_local, out_meso, out_global, link_loss, ent_loss = self.net2(batch)
 
-                ce_loss = self.criterion(out, batch.y)
-                loss = (1.0 * ce_loss) + (aux_weight * link_loss) + (aux_weight * ent_loss)
+                ce_loss_global = self.criterion(out_global, batch.y)
+                ce_loss_meso = self.criterion(out_meso, batch.y)
+                ce_loss_local = self.criterion(out_local, batch.y)
+
+                loss = (1.0 * ce_loss_global) + \
+                       (gamma * ce_loss_meso) + \
+                       (gamma * ce_loss_local) + \
+                       (0.1 * link_loss) + \
+                       (0.1 * ent_loss)
+
                 loss.backward()
                 self.optimizer.step()
 
                 total_loss += loss.item()
-                pred = out.argmax(dim=1)
+                pred = out_global.argmax(dim=1)
                 correct += (pred == batch.y).sum().item()
                 total_samples += batch.y.size(0)
 
@@ -125,41 +140,64 @@ class Trainer(object):
             self.net2.eval()
 
             test_loss, correct, test_samples = 0, 0, 0
-            test_preds, test_labels = [], []
+            test_preds, test_labels, test_probes = [], [], []
             for batch in self.test_dataloader:
                 batch = batch.to(device)
 
                 batch.x = self.node_embed(batch)
-                out, link_loss, ent_loss = self.net2(batch)
+                out_global, out_meso, out_local, link_loss, ent_loss = self.net2(batch)
 
-                ce_loss = self.criterion(out, batch.y)
-                loss = (1.0 * ce_loss) + (aux_weight * link_loss) + (aux_weight * ent_loss)
+                ce_loss_global = self.criterion(out_global, batch.y)
+                ce_loss_meso = self.criterion(out_meso, batch.y)
+                ce_loss_local = self.criterion(out_local, batch.y)
+
+                loss = (1.0 * ce_loss_global) + \
+                       (gamma * ce_loss_meso) + \
+                       (gamma * ce_loss_local) + \
+                       (0.1 * link_loss) + \
+                       (0.1 * ent_loss)
+
                 test_loss += loss.item()
 
-                pred = out.argmax(dim=1)
+                pred = out_global.argmax(dim=1)
                 correct += (pred == batch.y).sum().item()
                 test_samples += batch.y.size(0)
 
+                probs = F.softmax(out_global, dim=1)
+
                 test_preds.extend(pred.cpu().numpy())
                 test_labels.extend(batch.y.cpu().numpy())
+                test_probes.extend(probs[:, 1].detach().cpu().numpy())
 
+            # Performance 1: ACC
             test_avg_loss = test_loss / len(self.test_dataloader)
             test_accuracy = 100 * correct / test_samples
 
             test_acc_list.append(test_accuracy)
 
+            # Performance 2: AUC
+            try:
+                test_auc = roc_auc_score(test_labels, test_probes)
+            except ValueError:
+                test_auc = 0.0  # 배치 안에 한 클래스만 있는 경우 에러 방지
+
+            # Best Performance
             if train_accuracy > best_train_acc:
                 best_train_acc = train_accuracy
 
             if test_accuracy > best_test_acc:
                 best_test_acc = test_accuracy
 
+            if test_auc > best_test_auc:
+                best_test_auc = test_auc
+
+
             print(f"Epoch {epoch + 1:03d} | Train Loss: {train_avg_loss:.4f} | Train ACC: {train_accuracy:.2f}%"
-                  f" | Test Loss: {test_avg_loss:.4f} | Test ACC: {test_accuracy:.2f}%")
+                  f" | Test Loss: {test_avg_loss:.4f} | Test ACC: {test_accuracy:.2f}% | Test AUC: {test_auc:.4f}")
 
         print("-" * 60)
         print(f"Training Finished!")
-        print(f"Best Train Acc: {best_train_acc:.2f}% | Best Test Acc: {best_test_acc:.2f}%")
+        print(f"Best Train Acc: {best_train_acc:.2f}% | Best Test Acc: {best_test_acc:.2f}% | Best Test AUC: {best_test_auc:.4f}")
         print("-" * 60)
 
         self.plot_results(train_acc_list, test_acc_list)
@@ -168,5 +206,3 @@ class Trainer(object):
 if __name__ == '__main__':
     trainer = Trainer()
     trainer.train()
-        
-
